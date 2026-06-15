@@ -8,7 +8,7 @@ Summary:        UBS atomic shared-memory primitives
 Name:           ubs-atomic
 ExclusiveArch:  aarch64
 Version:        1.0.0
-Release:        5
+Release:        6
 License:        Mulan PSL v2
 URL:            https://atomgit.com/openeuler/ubs-atomic
 Source0:        %{name}-%{version}.tar.gz
@@ -62,6 +62,8 @@ cmake --install %{cmake_build_dir} --prefix %{buildroot}/usr
 /usr/include/ub_dist_tx_res.h
 
 %changelog
+* Mon June 15 2026 Sami <abudusaimikuerban@h-partners.com> - 1.0.0-6
+- fix: For B026 package, form PR45
 * Tue June 02 2026 Sami <abudusaimikuerban@h-partners.com> - 1.0.0-5
 - fix: For B020 package, form PR39
 * Tue May 26 2026 Sami <abudusaimikuerban@h-partners.com> - 1.0.0-4
