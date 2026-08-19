@@ -8,12 +8,11 @@ Summary:        UBS atomic shared-memory primitives
 Name:           ubs-atomic
 ExclusiveArch:  aarch64
 Version:        1.0.0
-Release:        8
+Release:        9
 License:        Mulan PSL v2
 URL:            https://atomgit.com/openeuler/ubs-atomic
 Source0:        %{name}-%{version}.tar.gz
 Group:          Development/Libraries
-Vendor:         Huawei Technologies Co., Ltd.
 Prefix: /usr
 
 BuildRequires:  cmake >= 3.22 make >= 4.3 gcc-c++ >= 10.3 gcc >= 10.3
@@ -62,6 +61,8 @@ cmake --install %{cmake_build_dir} --prefix %{buildroot}/usr
 /usr/include/ub_dist_tx_res.h
 
 %changelog
+* Wed Aug 19 2026 David Hwang <huangdewei@huawei.com> - 1.0.0-9
+- fix: update spec
 * Tue Aug 04 2026 David Hwang <huangdewei@huawei.com> - 1.0.0-8
 - fix: package update, form PR54
 * Tue Jul 14 2026 David Hwang <huangdewei@huawei.com> - 1.0.0-7
