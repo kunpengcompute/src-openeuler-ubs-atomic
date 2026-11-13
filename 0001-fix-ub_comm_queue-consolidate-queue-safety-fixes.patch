@@ -1,0 +1,506 @@
+From de928bfb87970f89825d219fa973b7c68b3f0094 Mon Sep 17 00:00:00 2001
+From: davidhwang <huangdewei@huawei.com>
+Date: Mon, 28 Sep 2026 10:12:42 +0800
+Subject: [PATCH 1/2] fix(ub_comm_queue): consolidate queue safety fixes
+
+42e0a257b09ad1bc19b6027dc79815c56f28bf56 fix(ub_comm_queue): clamp dequeue body_length to prevent OOB read
+71c8bd374cec2a92be34a82e128cb53226e3c31b fix(ub_comm_queue): reject out-of-range node_id to prevent OOB access
+d9c59e01d861804f0a59fcaa92874a24320828a8 fix(ub_comm_queue): tolerate dispatcher CPU affinity failures
+ea0bef413ed9ac0e63cd398c6b96e6f41dfe1a4b fix(ub_comm_queue): contain asynchronous dispatch allocation and enqueue errors
+3cedee9fd466e629800f9b69293d57f4f9ef0743 fix(ub_comm_queue): validate heartbeat timeout against polling interval
+---
+ src/ub_comm_queue/MPSCRingBuffer.cpp          |  17 +-
+ src/ub_comm_queue/UBShmTransport.cpp          |  69 ++++-
+ .../ub_comm_queue/mpsc_ring_buffer_test.cpp   |  54 ++++
+ .../ub_comm_queue/ub_comm_queue_api_test.cpp  | 240 ++++++++++++++++++
+ 4 files changed, 364 insertions(+), 16 deletions(-)
+
+diff --git a/src/ub_comm_queue/MPSCRingBuffer.cpp b/src/ub_comm_queue/MPSCRingBuffer.cpp
+index 5d90ba7de34244f19a6c9ba25e4d940799dd98b3..de00d12adc11429279f1dcf41d49c9be284d4327 100644
+--- a/src/ub_comm_queue/MPSCRingBuffer.cpp
++++ b/src/ub_comm_queue/MPSCRingBuffer.cpp
+@@ -584,8 +584,21 @@ uint32_t MPSCRingBuffer::dequeue(void *buffer, uint32_t buffer_cap)
+     }
+ 
+     auto *hdr = reinterpret_cast<message_header_t *>(entry->data);
+-    uint32_t real_len = sizeof(message_header_t) + hdr->body_length;
+-    uint32_t copy_len = (real_len > buffer_cap) ? buffer_cap : real_len;
++    // 防御：body_length 来自共享内存 Entry 头，可能被半写/越界/篡改。
++    // 合法消息满足 sizeof(header) + body_length <= max_msg_size_（enqueue 已强制），
++    // 用 64 位计算避免 uint32 回绕；超限说明 Entry 损坏，跳过该消息而非按 buffer_cap
++    // 截断读取，否则 memcpy 会越过 entry_stride_ 读到相邻槽位甚至越出共享内存映射。
++    uint64_t real_len = static_cast<uint64_t>(sizeof(message_header_t)) + hdr->body_length;
++    if (__builtin_expect(real_len > max_msg_size_, 0)) {
++        ATOMIC_LOG(LOG_LEVEL_ERROR,
++                   "Corrupt ring entry skipped: body_length=%u exceeds max_msg_size=%llu, ring=%p head=%llu",
++                   hdr->body_length, static_cast<unsigned long long>(max_msg_size_), (void *)this,
++                   static_cast<unsigned long long>(cur_head));
++        entry->ready_seq.store(0, std::memory_order_relaxed);
++        head_.store(expected_seq, std::memory_order_release);
++        return 0;
++    }
++    uint32_t copy_len = (real_len > buffer_cap) ? buffer_cap : static_cast<uint32_t>(real_len);
+ 
+     std::memcpy(buffer, entry->data, copy_len);
+     // 重置状态
+diff --git a/src/ub_comm_queue/UBShmTransport.cpp b/src/ub_comm_queue/UBShmTransport.cpp
+index 011989698fee749250452b96b7aa2a6fc37c51e6..0c722abcdc932a7e73f71e89309d31f8d32eca83 100644
+--- a/src/ub_comm_queue/UBShmTransport.cpp
++++ b/src/ub_comm_queue/UBShmTransport.cpp
+@@ -371,8 +371,17 @@ int UBShmTransport::build_node_mapping(const ub_ring_region_map_t *ring_map)
+ {
+     std::set<uint32_t> all_ids;
+     for (uint32_t i = 0; i < ring_map->count; ++i) {
+-        all_ids.insert(ring_map->entries[i].node_id);
+-        ATOMIC_LOG(LOG_LEVEL_DEBUG, "Add Node ID: %u", ring_map->entries[i].node_id);
++        // node_id 为 uint8_t（可到 255），但 ring_caches_/remote_lookup_table_ 等内部数组仅
++        // [MAX_NODES_LIMIT][MAX_PRIORITY_LEVELS]。必须在建映射时拒绝越界 node_id，否则非法 id
++        // 会进入 node_id_to_idx_/idx_to_node_id_，后续以逻辑 node_id 直接下标访问将越界写相邻内存。
++        const uint32_t nid = ring_map->entries[i].node_id;
++        if (nid >= MAX_NODES_LIMIT) {
++            ATOMIC_LOG(LOG_LEVEL_ERROR, "Invalid node_id %u at ring map index %u, must be < %u", nid, i,
++                       MAX_NODES_LIMIT);
++            return -EINVAL;
++        }
++        all_ids.insert(nid);
++        ATOMIC_LOG(LOG_LEVEL_DEBUG, "Add Node ID: %u", nid);
+     }
+     // 限制检查
+     if (all_ids.size() > MAX_NODES_LIMIT || all_ids.size() != conf_.max_nodes) {
+@@ -1082,7 +1091,14 @@ bool UBShmTransport::query_inited(const uint8_t node_id)
+ void UBShmTransport::run_dispatcher_loop()
+ {
+     if (cpu_id_ != -1) {
+-        pin_this_thread_to_cpu(cpu_id_);
++        // pin_this_thread_to_cpu 失败时抛 std::runtime_error；异常若逃逸出线程函数会触发
++        // std::terminate 使整个进程崩溃。绑核仅为性能优化，失败时降级为告警并继续不绑核运行。
++        try {
++            pin_this_thread_to_cpu(cpu_id_);
++        } catch (const std::exception &e) {
++            ATOMIC_LOG(LOG_LEVEL_WARN, "Dispatcher failed to pin to cpu %d: %s, continue without pinning", cpu_id_,
++                       e.what());
++        }
+     }
+     std::vector<char> buffer(max_msg_size_global_);
+     while (!stop_flag_.load(std::memory_order_relaxed)) {
+@@ -1168,16 +1184,29 @@ int UBShmTransport::dispatch_internal(const void *data, uint32_t len)
+ 
+         // 异步拷贝
+         uint32_t body_len = len - sizeof(message_header_t);
+-        std::string body_copy(body_ptr, body_len);
+-        auto f = info.func;
+-        auto ctx = info.ctx;
+-        auto hdr_copy = *hdr;
+-        worker_pool_->enqueue([f, ctx, hdr_copy, body = std::move(body_copy)]() mutable {
+-            message_t m;
+-            m.header = hdr_copy;
+-            m.body = const_cast<char *>(body.data());
+-            f(&m, ctx);
+-        });
++        // 消息已出队，提交失败时记录并丢弃；不重试，避免阻塞分发线程。
++        try {
++            std::string body_copy(body_ptr, body_len);
++            auto f = info.func;
++            auto ctx = info.ctx;
++            auto hdr_copy = *hdr;
++            worker_pool_->enqueue([f, ctx, hdr_copy, body = std::move(body_copy)]() mutable {
++                message_t m;
++                m.header = hdr_copy;
++                m.body = const_cast<char *>(body.data());
++                f(&m, ctx);
++            });
++        } catch (const std::bad_alloc &) {
++            ATOMIC_LOG(LOG_LEVEL_ERROR,
++                       "Async dispatch dropped: allocation failed, node=%u src=%u type=%u body_length=%u",
++                       conf_.current_node_id, hdr->src_node_id, hdr->msg_type, body_len);
++            return -ENOMEM;
++        } catch (const std::exception &e) {
++            ATOMIC_LOG(LOG_LEVEL_ERROR,
++                       "Async dispatch dropped: enqueue failed, node=%u src=%u type=%u body_length=%u: %s",
++                       conf_.current_node_id, hdr->src_node_id, hdr->msg_type, body_len, e.what());
++            return -EPIPE;
++        }
+     }
+     return 0;
+ }
+@@ -1271,7 +1300,14 @@ int UBShmTransport::config_heartbeat(const ub_comm_queue_heartbeat_config_t *req
+         return -EINVAL;
+     }
+     if (request != nullptr) {
+-        if (request->heartbeat_interval_ms == 0 || request->check_interval_ms == 0 || request->timeout_ms == 0) {
++        // 配置入口校验，不增加心跳轮询开销；先提升为 64 位，避免乘二溢出后绕过校验。
++        if (request->heartbeat_interval_ms == 0 || request->check_interval_ms == 0 || request->timeout_ms == 0 ||
++            static_cast<uint64_t>(request->timeout_ms) < 2ULL * request->check_interval_ms) {
++            ATOMIC_LOG(LOG_LEVEL_ERROR,
++                       "Invalid heartbeat config: node=%u heartbeat_interval_ms=%u check_interval_ms=%u timeout_ms=%u; "
++                       "require nonzero values and timeout_ms >= 2 * check_interval_ms",
++                       conf_.current_node_id, request->heartbeat_interval_ms, request->check_interval_ms,
++                       request->timeout_ms);
+             return -EINVAL;
+         }
+ 
+@@ -1349,6 +1385,11 @@ int UBShmTransport::set_is_for_lock(bool is_for_lock)
+ int UBShmTransport::try_populate_cache(uint32_t node_id, uint32_t prio)
+ {
+     ATOMIC_LOG(LOG_LEVEL_DEBUG, "Trying to populate cache for node %d, priority %d", node_id, prio);
++    // 纵深防御：ring_caches_ 仅 [MAX_NODES_LIMIT][MAX_PRIORITY_LEVELS]，node_id/prio 越界会破坏相邻内存。
++    if (node_id >= MAX_NODES_LIMIT) {
++        ATOMIC_LOG(LOG_LEVEL_ERROR, "Invalid node_id %u exceeds MAX_NODES_LIMIT %u", node_id, MAX_NODES_LIMIT);
++        return -EINVAL;
++    }
+     if (prio >= MAX_PRIORITY_LEVELS) {
+         ATOMIC_LOG(LOG_LEVEL_ERROR, "Invalid priority %u", prio);
+         return -EINVAL;
+diff --git a/test/testcase/ub_comm_queue/mpsc_ring_buffer_test.cpp b/test/testcase/ub_comm_queue/mpsc_ring_buffer_test.cpp
+index a5f8dc39a3a14b4ddf453f446d5bd26c2ae5be16..ff9dd68a9f116234c732be79d3c9f7ced0d63e43 100644
+--- a/test/testcase/ub_comm_queue/mpsc_ring_buffer_test.cpp
++++ b/test/testcase/ub_comm_queue/mpsc_ring_buffer_test.cpp
+@@ -584,5 +584,59 @@ TEST(MPSCRingBufferTest, DequeueClearsReadySeqAndAdvancesHead)
+     EXPECT_EQ(ring->dequeue(out.data(), out.size()), 0u);
+ }
+ 
++// 问题#9：dequeue 直接信任共享内存 Entry 头的 body_length，仅按 buffer_cap 截断，
++// 未按本环 max_msg_size_ 钳制。异常 body_length 会使 memcpy 越过 entry_stride_ 越界读。
++// 修复后：超限 Entry 被识别为损坏并跳过（返回 0 且推进 head），不越界、不卡死。
++TEST(MPSCRingBufferTest, DequeueSkipsCorruptEntryWithOversizedBodyLength)
++{
++    constexpr uint32_t capacity = 4;
++    constexpr uint32_t maxMsgSize = 128;
++    auto mem = AllocRingMemory(capacity, maxMsgSize);
++    ASSERT_NE(mem, nullptr);
++    auto *ring = ConstructRing(mem.get(), capacity, maxMsgSize);
++
++    // buffer_cap 远大于单 entry 数据区，模拟真实分发缓冲区（max_msg_size_global_）
++    std::vector<char> out(4096);
++
++    // 场景1：body_length 为回绕级超大值（0xFFFFFFFF），修复前 real_len 截断/越界读
++    message_header_t wrapCorrupt = MakeHeader(0xFFFFFFFFu);
++    WriteReadyEntry(ring, 0, wrapCorrupt, nullptr, 0);
++    EXPECT_EQ(ring->dequeue(out.data(), out.size()), 0u);
++    EXPECT_EQ(ring->head_.load(std::memory_order_acquire), 1u); // 已跳过，head 推进
++
++    // 场景2：body_length 超过 max_msg_size_ 但不回绕（修复前按 buffer_cap 越界读脏数据）
++    message_header_t bigCorrupt = MakeHeader(maxMsgSize * 2);
++    WriteReadyEntry(ring, 1, bigCorrupt, nullptr, 0);
++    EXPECT_EQ(ring->dequeue(out.data(), out.size()), 0u);
++    EXPECT_EQ(ring->head_.load(std::memory_order_acquire), 2u);
++
++    // 场景3：合法消息仍能正常出队（回归，确认钳制不误伤正常路径）
++    const char body[] = "ok";
++    message_header_t good = MakeHeader(sizeof(body));
++    WriteReadyEntry(ring, 2, good, body, sizeof(body));
++    EXPECT_EQ(ring->dequeue(out.data(), out.size()), sizeof(message_header_t) + sizeof(body));
++    EXPECT_EQ(ring->head_.load(std::memory_order_acquire), 3u);
++}
++
++// 问题#9 边界：body_length 恰好使 real_len == max_msg_size_ 时应视为合法并正常拷贝。
++TEST(MPSCRingBufferTest, DequeueAcceptsBodyLengthAtMaxMsgSizeBoundary)
++{
++    constexpr uint32_t capacity = 4;
++    constexpr uint32_t maxMsgSize = sizeof(message_header_t) + 16;
++    auto mem = AllocRingMemory(capacity, maxMsgSize);
++    ASSERT_NE(mem, nullptr);
++    auto *ring = ConstructRing(mem.get(), capacity, maxMsgSize);
++
++    // real_len = sizeof(header) + body_length == maxMsgSize，处于合法上界
++    const uint32_t bodyLen = maxMsgSize - sizeof(message_header_t);
++    char body[16] = "boundary";
++    message_header_t hdr = MakeHeader(bodyLen);
++    WriteReadyEntry(ring, 0, hdr, body, bodyLen);
++
++    std::vector<char> out(maxMsgSize);
++    EXPECT_EQ(ring->dequeue(out.data(), out.size()), maxMsgSize);
++    EXPECT_EQ(ring->head_.load(std::memory_order_acquire), 1u);
++}
++
+ } // namespace ut
+ } // namespace ub_comm_queue
+diff --git a/test/testcase/ub_comm_queue/ub_comm_queue_api_test.cpp b/test/testcase/ub_comm_queue/ub_comm_queue_api_test.cpp
+index d5a6839dd9583eb7db2634002c6333bf926fb1ca..7ab73b0c82f201b615645fe8cad22ba47d11c92e 100644
+--- a/test/testcase/ub_comm_queue/ub_comm_queue_api_test.cpp
++++ b/test/testcase/ub_comm_queue/ub_comm_queue_api_test.cpp
+@@ -7,20 +7,69 @@
+ #include <ctime>
+ #include <functional>
+ #include <memory>
++#include <new>
+ #include <thread>
+ #include <vector>
+ 
+ #include "gtest/gtest.h"
++#include "mockcpp/mokc.h"
+ 
+ #define private public
+ #include "UBShmTransport.h"
+ #undef private
+ #include "ub_dist_comm_queue.h"
+ 
++namespace {
++// 仅 UT 替换分配器；故障开关限于当前线程，且只影响下一次分配。
++thread_local bool g_fail_next_allocation = false;
++
++class ScopedAllocationFailure {
++public:
++    ScopedAllocationFailure()
++    {
++        g_fail_next_allocation = true;
++    }
++    ~ScopedAllocationFailure()
++    {
++        g_fail_next_allocation = false;
++    }
++};
++} // namespace
++
++void *operator new(std::size_t size)
++{
++    if (g_fail_next_allocation) {
++        g_fail_next_allocation = false;
++        throw std::bad_alloc();
++    }
++    while (true) {
++        if (void *ptr = std::malloc(size == 0 ? 1 : size)) {
++            return ptr;
++        }
++        auto handler = std::get_new_handler();
++        if (handler == nullptr) {
++            throw std::bad_alloc();
++        }
++        handler();
++    }
++}
++
++void operator delete(void *ptr) noexcept
++{
++    std::free(ptr);
++}
++
++void operator delete(void *ptr, std::size_t) noexcept
++{
++    std::free(ptr);
++}
++
+ namespace ub_comm_queue {
+ namespace ut {
+ namespace {
+ static constexpr uint32_t DEFAULT_NODE_NUM = 2;
++// mockcpp 不支持 noexcept 函数类型，转为同签名的普通函数指针进行打桩。
++using SetAffinityFunction = int (*)(pthread_t, size_t, const cpu_set_t *);
+ void DummyCallback(const message_t *, void *) {}
+ std::atomic<uint32_t> g_async_callback_count{0};
+ std::atomic<uint32_t> g_log_callback_count{0};
+@@ -296,6 +345,78 @@ TEST(UbCommQueueApiTest, InitDeinitAndWrapperMethodsUseTransport)
+     EXPECT_EQ(g_transport, nullptr);
+ }
+ 
++// 问题#10：build_node_mapping 仅校验节点数量不校验单个 node_id 取值范围，node_id 为 uint8_t（可到 255）。
++// ring_map 中出现 node_id >= MAX_NODES_LIMIT(16) 时初始化可通过，后续以逻辑 node_id 直接下标
++// 访问 ring_caches_[node_id][prio]（数组仅 [16][8]）越界写相邻内存。修复后 init 直接拒绝。
++TEST(UbCommQueueApiTest, InitRejectsNodeIdExceedingMaxNodesLimit)
++{
++    g_transport = nullptr;
++    ApiEnv env(200); // node_id=200，远超 MAX_NODES_LIMIT
++    ub_shm_comm_t handle = nullptr;
++    EXPECT_NE(ub_comm_queue_init(&handle, env.InitArea(), env.RingMap(), env.Conf()), UB_COMM_OK);
++    EXPECT_EQ(handle, nullptr);
++    g_transport = nullptr;
++}
++
++// 问题#10 纵深防御：try_populate_cache 直接以 node_id 下标访问 ring_caches_，修复前仅校验 prio。
++// 修复后对 node_id >= MAX_NODES_LIMIT 返回 -EINVAL，杜绝越界访问。
++TEST(UbCommQueueApiTest, TryPopulateCacheRejectsOutOfRangeNodeId)
++{
++    g_transport = nullptr;
++    ApiEnv env(0);
++    ub_shm_comm_t handle = nullptr;
++    ASSERT_EQ(ub_comm_queue_init(&handle, env.InitArea(), env.RingMap(), env.Conf()), UB_COMM_OK);
++    auto *transport = static_cast<UBShmTransport *>(handle);
++    EXPECT_EQ(transport->try_populate_cache(MAX_NODES_LIMIT, 0), -EINVAL);     // 边界：恰好越界
++    EXPECT_EQ(transport->try_populate_cache(200, 0), -EINVAL);                 // 远超上界
++    EXPECT_EQ(transport->try_populate_cache(0, MAX_PRIORITY_LEVELS), -EINVAL); // prio 越界仍被拒
++    EXPECT_EQ(ub_comm_queue_deinit(&handle), UB_COMM_OK);
++    g_transport = nullptr;
++}
++
++class UbCommQueueFaultTest : public ::testing::Test {
++protected:
++    void TearDown() override
++    {
++        GlobalMockObject::verify();
++    }
++};
++
++// 问题#11：模拟绑核失败，验证真实分发线程仍能接收并处理后续消息。
++TEST_F(UbCommQueueFaultTest, DispatcherContinuesAfterPinFailure)
++{
++    MOCKER(static_cast<SetAffinityFunction>(pthread_setaffinity_np)).expects(once()).will(returnValue(EINVAL));
++    g_async_callback_count.store(0, std::memory_order_release);
++    ApiEnv env(0);
++    env.Conf()->cpu_id = 0;
++    UBShmTransport transport;
++    ASSERT_EQ(transport.init(env.InitArea(), env.RingMap(), env.Conf()), UB_COMM_OK);
++    ASSERT_EQ(transport.register_func(8, UB_FUNC_SYNC, AsyncCallback, nullptr), UB_COMM_OK);
++
++    message_t msg = MakeMessage(8);
++    ASSERT_EQ(transport.send(&msg), UB_COMM_OK);
++    EXPECT_TRUE(WaitUntil(std::chrono::milliseconds(300),
++                          []() { return g_async_callback_count.load(std::memory_order_acquire) == 1; }));
++}
++
++TEST_F(UbCommQueueFaultTest, DispatcherSkipsPinningWhenDisabled)
++{
++    MOCKER(static_cast<SetAffinityFunction>(pthread_setaffinity_np)).expects(never());
++    UBShmTransport transport;
++    transport.cpu_id_ = -1;
++    transport.stop_flag_.store(true, std::memory_order_release);
++    EXPECT_NO_THROW(transport.run_dispatcher_loop());
++}
++
++TEST_F(UbCommQueueFaultTest, DispatcherAcceptsSuccessfulPinning)
++{
++    MOCKER(static_cast<SetAffinityFunction>(pthread_setaffinity_np)).expects(once()).will(returnValue(0));
++    UBShmTransport transport;
++    transport.cpu_id_ = 0;
++    transport.stop_flag_.store(true, std::memory_order_release);
++    EXPECT_NO_THROW(transport.run_dispatcher_loop());
++}
++
+ TEST(UbCommQueueApiTest, SecondInitIsMarkedNonLockAndBadConfigReturnsError)
+ {
+     g_transport = nullptr;
+@@ -369,6 +490,73 @@ TEST(UbCommQueueApiTest, AsyncCallbackDispatchesThroughThreadPool)
+     EXPECT_EQ(ub_comm_queue_deinit(&handle), UB_COMM_OK);
+ }
+ 
++// 问题#12：无线程和已关闭的线程池均会抛异常，失败后同步和异步分发应仍可继续。
++TEST_F(UbCommQueueFaultTest, AsyncDispatchRecoversAfterEnqueueFailure)
++{
++    g_async_callback_count.store(0, std::memory_order_release);
++    UBShmTransport transport;
++    ASSERT_EQ(transport.register_func(8, UB_FUNC_ASYNC, AsyncCallback, nullptr), UB_COMM_OK);
++    auto hdr = MakeMessage(8).header;
++    EXPECT_EQ(transport.dispatch_internal(&hdr, sizeof(hdr)), -EPIPE);
++
++    transport.worker_pool_ = new ThreadPool(0);
++    EXPECT_EQ(transport.dispatch_internal(&hdr, sizeof(hdr)), -EPIPE);
++    EXPECT_TRUE(transport.worker_pool_->taskQueue_.empty());
++    transport.worker_pool_->shuttingDown_.store(true, std::memory_order_release);
++    EXPECT_EQ(transport.dispatch_internal(&hdr, sizeof(hdr)), -EPIPE);
++    EXPECT_TRUE(transport.worker_pool_->taskQueue_.empty());
++    EXPECT_EQ(g_async_callback_count.load(std::memory_order_acquire), 0u);
++
++    ASSERT_EQ(transport.register_func(8, UB_FUNC_SYNC, AsyncCallback, nullptr), UB_COMM_OK);
++    EXPECT_EQ(transport.dispatch_internal(&hdr, sizeof(hdr)), UB_COMM_OK);
++    EXPECT_EQ(g_async_callback_count.load(std::memory_order_acquire), 1u);
++
++    delete transport.worker_pool_;
++    transport.worker_pool_ = nullptr;
++    transport.worker_pool_ = new ThreadPool(1);
++    ASSERT_EQ(transport.register_func(8, UB_FUNC_ASYNC, AsyncCallback, nullptr), UB_COMM_OK);
++    EXPECT_EQ(transport.dispatch_internal(&hdr, sizeof(hdr)), UB_COMM_OK);
++    EXPECT_TRUE(WaitUntil(std::chrono::milliseconds(300),
++                          []() { return g_async_callback_count.load(std::memory_order_acquire) == 2; }));
++}
++
++void CheckAsyncAllocationFailure(uint32_t bodyLength)
++{
++    g_async_callback_count.store(0, std::memory_order_release);
++    UBShmTransport transport;
++    transport.worker_pool_ = new ThreadPool(1);
++    ASSERT_EQ(transport.register_func(8, UB_FUNC_ASYNC, AsyncCallback, nullptr), UB_COMM_OK);
++    struct {
++        message_header_t header;
++        char body[128];
++    } packet{};
++    packet.header = MakeMessage(8).header;
++    packet.header.body_length = bodyLength;
++    const uint32_t len = sizeof(message_header_t) + bodyLength;
++    int result = UB_COMM_OK;
++    {
++        ScopedAllocationFailure failure;
++        EXPECT_NO_THROW(result = transport.dispatch_internal(&packet, len));
++    }
++    EXPECT_EQ(result, -ENOMEM);
++    EXPECT_EQ(g_async_callback_count.load(std::memory_order_acquire), 0u);
++    EXPECT_EQ(transport.dispatch_internal(&packet, len), UB_COMM_OK);
++    EXPECT_TRUE(WaitUntil(std::chrono::milliseconds(300),
++                          []() { return g_async_callback_count.load(std::memory_order_acquire) == 1; }));
++}
++
++TEST_F(UbCommQueueFaultTest, AsyncDispatchHandlesBodyCopyAllocationFailure)
++{
++    // 超过短字符串优化容量，第一次分配发生于 body_copy 构造。
++    CheckAsyncAllocationFailure(128);
++}
++
++TEST_F(UbCommQueueFaultTest, AsyncDispatchHandlesTaskAllocationFailure)
++{
++    // 空消息体无需分配，第一次分配发生于 enqueue 创建任务。
++    CheckAsyncAllocationFailure(0);
++}
++
+ TEST(UbCommQueueApiTest, UBCQ_IF_RCV_EER_001_QueryDefaultHeartbeatConfig)
+ {
+     ApiEnv env(0);
+@@ -402,6 +590,58 @@ TEST(UbCommQueueApiTest, UBCQ_IF_RCV_EER_002_SetHeartbeatConfigWithoutQuery)
+     EXPECT_EQ(ub_comm_queue_deinit(&handle), UB_COMM_OK);
+ }
+ 
++// 问题#13：拒绝超时窗口不足及乘二溢出边界，失败不得修改本地配置或公告牌。
++TEST(UbCommQueueApiTest, HeartbeatRejectsInvalidConfigWithoutSideEffects)
++{
++    Billboard board{};
++    UBShmTransport transport;
++    transport.init_region_ptr_ = reinterpret_cast<char *>(&board);
++    transport.node_id_to_idx_.emplace(0, 0);
++    ub_shm_comm_t handle = &transport;
++    const ub_comm_queue_heartbeat_config_t baseline{10, 5, 20};
++    ASSERT_EQ(ub_comm_queue_config_heartbeat(&handle, &baseline, nullptr), UB_COMM_OK);
++    const ub_comm_queue_heartbeat_config_t invalid[] = {
++        {25, 10, 19}, {25, UINT32_MAX / 2 + 1, UINT32_MAX}, {25, UINT32_MAX, UINT32_MAX}, {0, 5, 20}, {25, 0, 20},
++        {25, 5, 0},
++    };
++    for (const auto &request : invalid) {
++        SCOPED_TRACE(::testing::Message() << "heartbeat=" << request.heartbeat_interval_ms << " check="
++                                          << request.check_interval_ms << " timeout=" << request.timeout_ms);
++        ub_comm_queue_heartbeat_config_t effective{7, 8, 9};
++        EXPECT_EQ(ub_comm_queue_config_heartbeat(&handle, &request, &effective), -EINVAL);
++        EXPECT_EQ(effective.heartbeat_interval_ms, 7u);
++        EXPECT_EQ(effective.check_interval_ms, 8u);
++        EXPECT_EQ(effective.timeout_ms, 9u);
++        EXPECT_EQ(ub_comm_queue_config_heartbeat(&handle, nullptr, &effective), UB_COMM_OK);
++        EXPECT_EQ(effective.heartbeat_interval_ms, baseline.heartbeat_interval_ms);
++        EXPECT_EQ(effective.check_interval_ms, baseline.check_interval_ms);
++        EXPECT_EQ(effective.timeout_ms, baseline.timeout_ms);
++        EXPECT_EQ(board.nodes[0].heartbeat_interval_ms.load(std::memory_order_acquire), baseline.heartbeat_interval_ms);
++    }
++}
++
++TEST(UbCommQueueApiTest, HeartbeatAcceptsTimeoutBoundaryAndLargeValues)
++{
++    // 不启动后台线程，避免极大测试间隔造成析构等待。
++    UBShmTransport transport;
++    ub_shm_comm_t handle = &transport;
++    const ub_comm_queue_heartbeat_config_t valid[] = {
++        {1, 1, 2},
++        {10, 5, 10},
++        {10, 5, 11},
++        {UINT32_MAX, UINT32_MAX / 2, UINT32_MAX},
++    };
++    for (const auto &request : valid) {
++        ub_comm_queue_heartbeat_config_t effective{};
++        EXPECT_EQ(ub_comm_queue_config_heartbeat(&handle, &request, &effective), UB_COMM_OK);
++        EXPECT_EQ(effective.heartbeat_interval_ms, request.heartbeat_interval_ms);
++        EXPECT_EQ(effective.check_interval_ms, request.check_interval_ms);
++        EXPECT_EQ(effective.timeout_ms, request.timeout_ms);
++        EXPECT_EQ(transport.heartbeat_timeout_us_.load(std::memory_order_acquire),
++                  static_cast<uint64_t>(request.timeout_ms) * 1000ULL);
++    }
++}
++
+ TEST(UbCommQueueApiTest, HeartbeatMonitorUsesPeerDeclaredIntervalBeforeTimingOut)
+ {
+     TwoNodeApiEnv env;
+-- 
+2.54.0
+

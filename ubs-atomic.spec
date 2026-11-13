@@ -8,10 +8,12 @@ Summary:        UBS atomic shared-memory primitives
 Name:           ubs-atomic
 ExclusiveArch:  aarch64
 Version:        1.0.0
-Release:        5%{?dist}
+Release:        6%{?dist}
 License:        Mulan PSL v2
 URL:            https://atomgit.com/openeuler/ubs-atomic
 Source0:        %{name}-%{version}.tar.gz
+Patch0001:     0001-fix-ub_comm_queue-consolidate-queue-safety-fixes.patch
+Patch0002:     0002-fix-ub_lock-consolidate-lock-safety-fixes.patch
 Group:          Development/Libraries
 Prefix: /usr
 
@@ -33,7 +35,7 @@ Requires:       glibc >= 2.34 libgcc >= 10.3 libstdc++ >= 10.3 libboundscheck >=
 UBS atomic shared-memory primitives.
 
 %prep
-%setup -q -T -b 0 -c -n %{project_dir}
+%autosetup -p1 -T -b 0 -n %{project_dir}
 
 %build
 cd %{_builddir}/%{project_dir}/
@@ -61,6 +63,9 @@ cmake --install %{cmake_build_dir} --prefix %{buildroot}/usr
 /usr/include/ub_dist_tx_res.h
 
 %changelog
+* Fri Nov 13 2026 davidhwang <huangdewei@huawei.com> - 1.0.0-6
+- [Type] sync
+- [DESC] synchronize version to opencloudos repository
 * Tue Jun 02 2026 Sami <abudusaimikuerban@h-partners.com> - 1.0.0-5
 - [Type] sync
 - [DESC] synchronize version to opencloudos repository
